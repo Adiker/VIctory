@@ -63,17 +63,23 @@ pub(crate) struct Parts<'a> {
 }
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
+    /// A phi whose incoming value has no DXIL form was read: redo with it
+    /// missing; with `true`, every incoming value was a hidden descriptor
+    /// word (see `Lower::stale`), and the phi is one too.
+    Retry(Value, Why, bool),
     Fail(ShaderError),
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut stale = HashSet::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, &stale).run() {
             Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
+            Err(Stop::Retry(v, why, hidden)) => {
+                if hidden {
+                    stale.insert(v);
+                }
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
                         offset: 0,
@@ -155,6 +161,8 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// Phis a previous round found joining hidden descriptor words only.
+    stale_phis: &'a HashSet<Value>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -169,6 +177,14 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Descriptor dwords no HLSL program can read (addresses, formats, meta
+    /// data): at a join with data they are what an undefined path left in
+    /// the register.
+    stale: HashSet<Value>,
+    /// Lanes of a VGPR value that hold a hidden descriptor word, written by
+    /// `v_writelane` at a constant lane (an SGPR spill): `v_readlane` of that
+    /// lane gives the hidden word back.
+    stale_lanes: HashMap<Value, Vec<u32>>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -433,6 +449,18 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
         out.insert(i.row, (i.pack2, b));
     }
     out
+}
+
+/// Why a hidden descriptor word restored from an SGPR spill has no value.
+const HIDDEN_SPILL: Why = "a descriptor's address or format read as data";
+
+/// The lane a `v_readlane`/`v_writelane` names, if it is a constant.
+fn const_lane(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -897,7 +925,7 @@ fn operand_const_lane(op: &Operand) -> Option<u32> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, stale_phis: &'a HashSet<Value>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1148,6 +1176,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            stale_phis,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -1160,6 +1189,8 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            stale: HashSet::new(),
+            stale_lanes: HashMap::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -2099,7 +2130,12 @@ impl<'a> Lower<'a> {
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                    _ if self.bad.contains_key(&phi.value) => {
+                        if self.stale_phis.contains(&phi.value) {
+                            self.stale.insert(phi.value);
+                        }
+                        Val::Missing(self.bad[&phi.value])
+                    }
                     Reg::Scc => {
                         let v = self.s.m.phi(self.cur, self.s.t.i1);
                         self.data_phis.push((v, b, i));
@@ -4450,6 +4486,18 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // Words HLSL cannot see: `GetDimensions` reads an image's sizes and
+        // levels (dwords 1-4) and a buffer's count (dword 2), and a structured
+        // buffer's stride (dword 1). Addresses (image 0, buffer 0 and 1),
+        // formats (buffer 3) and an image's array pitch and meta data (5-7)
+        // are not. Read as data they are refused, but at a join with data
+        // they are the stale register of a path that leaves the value
+        // undefined (see `fill_phis`).
+        let hidden = |rel: u32| match image {
+            Some(_) => matches!(rel, 0 | 5..=7),
+            None if props.0 & 0xFFF == 12 => matches!(rel, 0 | 3),
+            None => matches!(rel, 0 | 1 | 3),
+        };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -4457,6 +4505,9 @@ impl<'a> Lower<'a> {
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
+                        if hidden(rel) {
+                            self.stale.insert(v);
+                        }
                     }
                 }
             }
@@ -5716,6 +5767,18 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                // A spilled hidden descriptor word comes back hidden.
+                if let (Some(Operand::Vector { reg, .. }), Some(l)) =
+                    (v.src.first(), v.src.get(1).and_then(const_lane))
+                    && let Some(src) = inst.read(Reg::V(*reg))
+                    && self.stale_lanes.get(&src).is_some_and(|ls| ls.contains(&l))
+                {
+                    for &(_, w) in &inst.writes {
+                        self.vals.insert(w, Val::Missing(HIDDEN_SPILL));
+                        self.stale.insert(w);
+                    }
+                    return Ok(());
+                }
                 if let Some(&moved) = self.spills.get(&(b, i)) {
                     let r = match moved {
                         Moved::Const(k) => self.s.m.i32(k),
@@ -5748,10 +5811,44 @@ impl<'a> Lower<'a> {
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
+                // Which lanes of the old value hold spilled hidden words, and
+                // whether this write spills one more (at a constant lane).
+                let lane_k = v.src.get(1).and_then(const_lane);
+                let mut hidden: Vec<u32> = inst
+                    .read(Reg::V(reg))
+                    .and_then(|o| self.stale_lanes.get(&o))
+                    .cloned()
+                    .unwrap_or_default();
+                hidden.retain(|&l| Some(l) != lane_k);
+                let spill = match (v.src.first(), lane_k) {
+                    (Some(Operand::Scalar { code, .. }), Some(_)) => inst
+                        .read(Reg::S(*code))
+                        .is_some_and(|x| self.stale.contains(&x)),
+                    _ => false,
+                };
+                if let Some(w) = inst.write(Reg::V(reg)) {
+                    if spill {
+                        hidden.push(lane_k.unwrap());
+                    }
+                    if !hidden.is_empty() {
+                        self.stale_lanes.insert(w, hidden);
+                    }
+                }
+                if spill {
+                    // shortcut: the spilled lane keeps the old value; only
+                    // `v_readlane` of that lane reads it, and gets the hidden
+                    // word back (see above). A spill slot read some other way
+                    // would see the old value instead.
+                    let old = match inst.read(Reg::V(reg)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
+                    return int(self, old);
+                }
+                let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let old = match inst.read(Reg::V(reg)) {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
@@ -8600,7 +8697,7 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
-            let mut incoming = Vec::new();
+            let mut edges = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
@@ -8616,11 +8713,27 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
+                edges.push((arg, qb, ballot));
+            }
+            // Whether a reachable path brings data: a hidden descriptor word
+            // on another path is then a value that path left undefined.
+            let data_in = !bit
+                && edges
+                    .iter()
+                    .any(|(arg, _, _)| matches!(self.vals.get(arg), Some(Val::I32(_))));
+            // Whether every path brings a hidden word: the phi is one too.
+            let all_hidden = !bit && edges.iter().all(|(arg, _, _)| self.stale.contains(arg));
+            let mut incoming = Vec::new();
+            for (arg, qb, ballot) in edges {
                 let ballot_ok = ballot.is_some();
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                        return Err(Stop::Retry(
+                            phi.value,
+                            "an SCC joined with SGPR values",
+                            false,
+                        ));
                     }
                     // A mask dword the other path left in the register: its ballot
                     // (a pixel or vertex program reads such a join only through a
@@ -8628,11 +8741,17 @@ impl<'a> Lower<'a> {
                     // wave's, so a join read some other way would differ from the
                     // console, which `mask_ok` does not see; upgrade if one shows up.
                     (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
+                    // shortcut: zero for the undefined path, as for an unread
+                    // join below. A program that did read such a word on that
+                    // path would see 0; HLSL has no way to.
+                    (Some(Val::Missing(_)), false) if data_in && self.stale.contains(&arg) => {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, why));
+                        return Err(Stop::Retry(phi.value, why, all_hidden));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        return Err(Stop::Retry(phi.value, "a join of mismatched values", false));
                     }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
@@ -9030,6 +9149,152 @@ mod tests {
             err.to_string().contains("constant buffer's descriptor read as data"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A raw buffer descriptor at s[8:11], used by `s_buffer_load_dword`,
+    /// whose dword 1 (`s9`, address high bits) `tail` reads as data, either
+    /// directly or (`join`) after a branch on s1 that overwrites s9 with data
+    /// on one path only.
+    fn raw_dword1(join: bool) -> Result<Lowered, crate::ShaderError> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+        ];
+        if join {
+            words.extend([
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0001, // s_cbranch_scc1 +1 (s9 keeps the descriptor's dword)
+                0xBE89_030C, // s_mov_b32 s9, s12
+            ]);
+        }
+        words.extend([
+            0x870D_C009, // s_and_b32 s13, s9, 64
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ]);
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        lower_with(&words, layout, used)
+    }
+
+    #[test]
+    fn a_raw_views_address_read_as_data_is_refused() {
+        let err = raw_dword1(false)
+            .err()
+            .expect("no host value for the address");
+        assert!(
+            err.to_string()
+                .contains("a descriptor's address or format read as data"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_raw_views_address_joined_with_data_is_the_undefined_path() {
+        // HLSL cannot read a raw view's address, so at the join the
+        // descriptor's dword is a register the other path left undefined.
+        raw_dword1(true).unwrap();
+    }
+
+    /// The raw view of [`raw_dword1`]; `prelude` decides what s9 holds
+    /// before `tail` reads it, `join` adds a branch on s1 that overwrites s9
+    /// with data on one path only.
+    fn hidden_dword1(prelude: &[u32], join: bool) -> Result<Lowered, crate::ShaderError> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+        ];
+        words.extend(prelude);
+        if join {
+            words.extend([
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0001, // s_cbranch_scc1 +1
+                0xBE89_030C, // s_mov_b32 s9, s12
+            ]);
+        }
+        words.extend([
+            0x870D_C009, // s_and_b32 s13, s9, 64
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ]);
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let layout = vec![
+            root(RootType::Table, 0, 0),
+            root(RootType::Constants, 1, 1),
+            root(RootType::Constants, 2, 2),
+        ];
+        lower_with(&words, layout, used)
+    }
+
+    /// A branch on s2 that keeps the descriptor or loads it again on one
+    /// path: s9 is then a join of two loads' dword 1, hidden words only.
+    const HIDDEN_PAIR: [u32; 4] = [
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+    ];
+
+    /// s9 spilled to lane 3 of v2, clobbered, and read back.
+    const SPILL: [u32; 5] = [
+        0xD761_0002,
+        0x0001_0609, // v_writelane_b32 v2, s9, 3
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xD760_0009,
+        0x0001_0702, // v_readlane_b32 s9, v2, 3
+    ];
+
+    fn refused_as_hidden(r: Result<Lowered, crate::ShaderError>) {
+        let err = r.err().expect("a hidden word read as data");
+        assert!(
+            err.to_string()
+                .contains("a descriptor's address or format read as data"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_join_of_hidden_words_is_hidden() {
+        // Read directly, the join of two hidden words is still refused.
+        refused_as_hidden(hidden_dword1(&HIDDEN_PAIR, false));
+        // Joined with data in turn, it is the undefined path.
+        hidden_dword1(&HIDDEN_PAIR, true).unwrap();
+    }
+
+    #[test]
+    fn a_spilled_hidden_word_comes_back_hidden() {
+        refused_as_hidden(hidden_dword1(&SPILL, false));
+        hidden_dword1(&SPILL, true).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

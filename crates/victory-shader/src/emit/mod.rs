@@ -849,6 +849,16 @@ mod tests {
         }
     }
 
+    /// Held while a test here dispatches: two GPU tests at once on WARP can
+    /// end the test process with an access violation (see
+    /// `valu_tests::ONE_AT_A_TIME`).
+    #[cfg(windows)]
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The hardware adapter and WARP, those there are.
     #[cfg(windows)]
     fn hosts() -> Vec<(&'static str, super::host::Host)> {
@@ -1031,6 +1041,8 @@ mod tests {
             ONE_THREAD,
         );
         #[cfg(windows)]
+        let _one = one_at_a_time();
+        #[cfg(windows)]
         for (name, host) in hosts() {
             unknown_stride_views_read_their_bytes(name, &host);
         }
@@ -1101,6 +1113,7 @@ mod tests {
             // (past its three elements) nothing, of the second 5, 9, 13, 17.
             let of_a = [101, 104, 107, 0];
             let of_b = [205, 209, 213, 217];
+            let _one = one_at_a_time();
             for (name, host) in hosts() {
                 let (root, pso) = host.compute_pipeline(&cs).unwrap();
                 // The slot each of the two groups reads, in the buffer in
@@ -1195,6 +1208,7 @@ mod tests {
                 .into_iter()
                 .flat_map(StrideEntry::words)
                 .collect();
+            let _one = one_at_a_time();
             for (name, host) in hosts() {
                 let (root, pso) = host.compute_pipeline(&cs).unwrap();
                 // s0: 1 takes the first load, 0 the second.

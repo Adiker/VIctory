@@ -2927,13 +2927,15 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A raw view for an SRV range. A descriptor of no listed kind (one
-        // fetched from the heap by index) that vector buffer accesses use is
-        // a buffer view in the title's heap too: an SRV if they only read
-        // it, a UAV if one writes it. Reading either slot through a
-        // constant buffer handle is a descriptor of the wrong type.
+        // A raw view for an SRV or UAV range. A descriptor of no listed kind
+        // (one fetched from the heap by index) that vector buffer accesses
+        // use is a buffer view in the title's heap too: an SRV if they only
+        // read it, a UAV if one writes it. A constant buffer handle is the
+        // wrong type for either slot (a UAV read through one removes the
+        // device).
         let raw = match kind {
             Some(u) if u.kind == ResourceType::Srv => Some(11),
+            Some(u) if u.kind == ResourceType::Uav => Some(11 | 0x1000),
             None => self.heap_buffer_view(src),
             _ => None,
         };

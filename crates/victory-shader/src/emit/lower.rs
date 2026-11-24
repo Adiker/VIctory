@@ -2855,13 +2855,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A descriptor of no listed kind (one fetched from the heap by
-        // index) that vector buffer loads read, and none write, is an SRV in
-        // the title's heap, not a constant buffer: reading its slot through
-        // a constant buffer handle is a descriptor of the wrong type.
-        let buffer_view = kind.is_none() && self.buffer_loads_only(src);
-        if buffer_view || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        // A raw view for an SRV range. A descriptor of no listed kind (one
+        // fetched from the heap by index) that vector buffer accesses use is
+        // a buffer view in the title's heap too: an SRV if they only read
+        // it, a UAV if one writes it. Reading either slot through a
+        // constant buffer handle is a descriptor of the wrong type.
+        let raw = match kind {
+            Some(u) if u.kind == ResourceType::Srv => Some(11),
+            None => self.heap_buffer_view(src),
+            _ => None,
+        };
+        if let Some(props) = raw {
+            let h = self.handle(site, src, false, (props, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -3268,10 +3273,11 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Whether vector buffer loads (`buffer_load_*`) read descriptor `src`
-    /// and no vector buffer access writes through it (which makes it a UAV).
-    fn buffer_loads_only(&self, src: &Source) -> bool {
-        let mut loads = false;
+    /// The raw view kind of descriptor `src` as vector buffer accesses use
+    /// it: an SRV (11) if they only read it, a UAV (`11 | 0x1000`) if one
+    /// writes through it (a store or an atomic), `None` if none uses it.
+    fn heap_buffer_view(&self, src: &Source) -> Option<u32> {
+        let mut view = None;
         for (&((b, i), sampler), &other) in &self.descriptors {
             if sampler || other != src {
                 continue;
@@ -3284,12 +3290,12 @@ impl<'a> Lower<'a> {
             }
             let name = inst.name();
             if name.starts_with("buffer_load") || name.starts_with("tbuffer_load") {
-                loads = true;
+                view.get_or_insert(11);
             } else {
-                return false;
+                return Some(11 | 0x1000);
             }
         }
-        loads
+        view
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -7197,14 +7203,14 @@ mod tests {
     }
 
     #[test]
-    fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view() {
+    fn scalar_loads_through_a_heap_buffer_that_vector_accesses_use_read_a_buffer_view() {
         // A descriptor from the resource heap (s0) at an index from a root
         // constant (s1), read by a scalar buffer load, then used by nothing
         // else, by a vector buffer load, or by a vector buffer store. A slot
-        // that vector loads read is a buffer view (an SRV), so the scalar
-        // load must not read it through a constant buffer handle (a
-        // descriptor of the wrong type). A store makes it a UAV, which a
-        // read-only view would not match either: that case is unchanged.
+        // that vector accesses use is a buffer view (an SRV if they only
+        // read it, a UAV if one writes it), so the scalar load must not read
+        // it through a constant buffer handle (a descriptor of the wrong
+        // type). With no other use, nothing says it isn't a CBV.
         #[derive(Clone, Copy)]
         enum Also {
             Nothing,
@@ -7257,7 +7263,7 @@ mod tests {
         };
         assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
         assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
-        assert_eq!(cbuffers(Also::Store), 1, "buffer_store: unchanged");
+        assert_eq!(cbuffers(Also::Store), 0, "buffer_store: a UAV");
     }
 
     #[test]
